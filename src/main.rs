@@ -19,7 +19,9 @@ fn print_help() {
     println!("  --dry-run          Show commands without executing them");
     println!("  --references-only  Update only the references (/home/koppe/references)");
     println!("  --system-only      Update only the system (rustup, apt, snap, npm)");
-    println!("  --apps-only        Update only the applications/tools (VS Code, cargo-update, etc.)");
+    println!(
+        "  --apps-only        Update only the applications/tools (VS Code, cargo-update, etc.)"
+    );
     println!("  --install-service  Install systemd boot & resume services for automatic updates");
     println!("  --help             Show this help message");
 }
@@ -45,7 +47,10 @@ fn parse_args() -> Result<Options, String> {
                 std::process::exit(0);
             }
             other => {
-                return Err(format!("Unknown argument: {}. Use --help for usage.", other));
+                return Err(format!(
+                    "Unknown argument: {}. Use --help for usage.",
+                    other
+                ));
             }
         }
         i += 1;
@@ -61,15 +66,18 @@ fn parse_args() -> Result<Options, String> {
 }
 
 fn run_cmd(name: &str, program: &str, args: &[&str], dry_run: bool) -> bool {
-    println!("[INFO] 🚀 Executing: {} ({} {})", name, program, args.join(" "));
+    println!(
+        "[INFO] 🚀 Executing: {} ({} {})",
+        name,
+        program,
+        args.join(" ")
+    );
     if dry_run {
         println!("[DRY-RUN] Skipped execution.");
         return true;
     }
 
-    let status = Command::new(program)
-        .args(args)
-        .status();
+    let status = Command::new(program).args(args).status();
 
     match status {
         Ok(s) if s.success() => {
@@ -87,18 +95,64 @@ fn run_cmd(name: &str, program: &str, args: &[&str], dry_run: bool) -> bool {
     }
 }
 
+fn run_cmd_fwupd(name: &str, program: &str, args: &[&str], dry_run: bool) -> bool {
+    println!(
+        "[INFO] 🚀 Executing: {} ({} {})",
+        name,
+        program,
+        args.join(" ")
+    );
+    if dry_run {
+        println!("[DRY-RUN] Skipped execution.");
+        return true;
+    }
+
+    let status = Command::new(program).args(args).status();
+
+    match status {
+        Ok(s) => {
+            let code = s.code().unwrap_or(-1);
+            // fwupdmgr returns exit code 2 when no updates available (success, just nothing to do)
+            if s.success() || code == 2 {
+                if code == 2 {
+                    println!(
+                        "[INFO] ℹ️  {} completed: no firmware updates available.",
+                        name
+                    );
+                } else {
+                    println!("[SUCCESS] ✅ {} completed successfully.", name);
+                }
+                true
+            } else {
+                eprintln!("[ERROR] ❌ {} failed with exit code: {}", name, code);
+                false
+            }
+        }
+        Err(e) => {
+            eprintln!("[ERROR] ❌ Failed to start command '{}': {}", program, e);
+            false
+        }
+    }
+}
+
 fn update_references(dry_run: bool) {
     let ref_path = "/home/koppe/references";
     println!("\n=== 📚 Updating References ({}) ===", ref_path);
 
     if !Path::new(ref_path).exists() {
-        println!("[WARN] References path '{}' does not exist. Skipping.", ref_path);
+        println!(
+            "[WARN] References path '{}' does not exist. Skipping.",
+            ref_path
+        );
         return;
     }
 
     let git_dir = format!("{}/.git", ref_path);
     if !Path::new(&git_dir).exists() {
-        println!("[WARN] References path '{}' is not a git repository. Skipping git pull.", ref_path);
+        println!(
+            "[WARN] References path '{}' is not a git repository. Skipping git pull.",
+            ref_path
+        );
         return;
     }
 
@@ -126,6 +180,13 @@ fn update_system(dry_run: bool) {
         let apt_success = run_cmd("Apt Update", "sudo", &["apt", "update"], dry_run);
         if apt_success {
             run_cmd("Apt Upgrade", "sudo", &["apt", "upgrade", "-y"], dry_run);
+            // Autoremove unused dependencies
+            run_cmd(
+                "Apt Autoremove",
+                "sudo",
+                &["apt", "autoremove", "-y"],
+                dry_run,
+            );
         }
     } else {
         println!("[INFO] apt package manager not found, skipping system package upgrade.");
@@ -145,7 +206,23 @@ fn update_system(dry_run: bool) {
         println!("[INFO] flatpak not found, skipping flatpak update.");
     }
 
-    // 5. NPM global packages update
+    // 5. Firmware updates (fwupd)
+    if which_command("fwupdmgr") {
+        println!("[INFO] Running firmware updates via fwupdmgr...");
+        // Use --force to avoid interactive prompt when remotes not enabled
+        let _ = run_cmd(
+            "Fwupd Refresh",
+            "fwupdmgr",
+            &["refresh", "--force"],
+            dry_run,
+        );
+        // fwupdmgr update returns exit code 2 when no updates available (not an error)
+        run_cmd_fwupd("Fwupd Update", "fwupdmgr", &["update", "-y"], dry_run);
+    } else {
+        println!("[INFO] fwupdmgr not found, skipping firmware updates.");
+    }
+
+    // 6. NPM global packages update
     if which_command("npm") {
         run_cmd("NPM Global Update", "npm", &["update", "-g"], dry_run);
     } else {
@@ -156,9 +233,46 @@ fn update_system(dry_run: bool) {
 fn update_apps(dry_run: bool) {
     println!("\n=== 📱 Updating Applications / Tools ===");
 
+    // VS Code update (detect installation method)
     if which_command("code") {
         println!("[INFO] VS Code (code CLI) is available.");
         let _ = Command::new("code").arg("--version").status();
+
+        // Detect installation method and update accordingly
+        if is_installed_via_apt("code") {
+            println!("[INFO] VS Code detected as apt package. Updating via apt...");
+            let _ = run_cmd(
+                "Apt Update (for VS Code)",
+                "sudo",
+                &["apt", "update"],
+                dry_run,
+            );
+            run_cmd(
+                "VS Code Upgrade",
+                "sudo",
+                &["apt", "upgrade", "-y", "code"],
+                dry_run,
+            );
+        } else if which_command("snap") && is_installed_via_snap("code") {
+            println!("[INFO] VS Code detected as snap package. Updating via snap...");
+            run_cmd(
+                "VS Code Snap Refresh",
+                "sudo",
+                &["snap", "refresh", "code"],
+                dry_run,
+            );
+        } else if which_command("flatpak") && is_installed_via_flatpak("com.visualstudio.code") {
+            println!("[INFO] VS Code detected as flatpak. Updating via flatpak...");
+            run_cmd(
+                "VS Code Flatpak Update",
+                "flatpak",
+                &["update", "-y", "com.visualstudio.code"],
+                dry_run,
+            );
+        } else {
+            println!("[INFO] VS Code installation method not detected (standalone/.deb manual). Skipping auto-update.");
+            println!("[HINT] Update manually from https://code.visualstudio.com/");
+        }
     } else {
         println!("[INFO] VS Code CLI ('code') not found in PATH.");
     }
@@ -167,10 +281,15 @@ fn update_apps(dry_run: bool) {
         let output = Command::new("cargo")
             .args(&["install-update", "--version"])
             .output();
-        
+
         if let Ok(o) = output {
             if o.status.success() {
-                run_cmd("Cargo Installed Binaries Update", "cargo", &["install-update", "-a"], dry_run);
+                run_cmd(
+                    "Cargo Installed Binaries Update",
+                    "cargo",
+                    &["install-update", "-a"],
+                    dry_run,
+                );
             } else {
                 println!("[INFO] cargo-update (cargo install-update) not installed. To install: cargo install cargo-update");
             }
@@ -232,7 +351,10 @@ WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibern
         return;
     }
     if let Err(e) = fs::write(resume_path, resume_service) {
-        eprintln!("[ERROR] Failed to write temporary resume service file: {}", e);
+        eprintln!(
+            "[ERROR] Failed to write temporary resume service file: {}",
+            e
+        );
         return;
     }
 
@@ -242,17 +364,50 @@ WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibern
     }
 
     // Move to /etc/systemd/system/ using sudo
-    if !run_cmd("Install Boot Service", "sudo", &["mv", boot_path, "/etc/systemd/system/system-all-update-boot.service"], false) {
+    if !run_cmd(
+        "Install Boot Service",
+        "sudo",
+        &[
+            "mv",
+            boot_path,
+            "/etc/systemd/system/system-all-update-boot.service",
+        ],
+        false,
+    ) {
         return;
     }
-    if !run_cmd("Install Resume Service", "sudo", &["mv", resume_path, "/etc/systemd/system/system-all-update-resume.service"], false) {
+    if !run_cmd(
+        "Install Resume Service",
+        "sudo",
+        &[
+            "mv",
+            resume_path,
+            "/etc/systemd/system/system-all-update-resume.service",
+        ],
+        false,
+    ) {
         return;
     }
 
     // Reload daemon and enable services
-    run_cmd("Systemd Daemon Reload", "sudo", &["systemctl", "daemon-reload"], false);
-    run_cmd("Enable Boot Service", "sudo", &["systemctl", "enable", "system-all-update-boot.service"], false);
-    run_cmd("Enable Resume Service", "sudo", &["systemctl", "enable", "system-all-update-resume.service"], false);
+    run_cmd(
+        "Systemd Daemon Reload",
+        "sudo",
+        &["systemctl", "daemon-reload"],
+        false,
+    );
+    run_cmd(
+        "Enable Boot Service",
+        "sudo",
+        &["systemctl", "enable", "system-all-update-boot.service"],
+        false,
+    );
+    run_cmd(
+        "Enable Resume Service",
+        "sudo",
+        &["systemctl", "enable", "system-all-update-resume.service"],
+        false,
+    );
 
     println!("[SUCCESS] 🎉 systemd services successfully installed and enabled!");
 }
@@ -262,6 +417,30 @@ fn which_command(cmd: &str) -> bool {
         .arg(cmd)
         .status()
         .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn is_installed_via_apt(package: &str) -> bool {
+    Command::new("dpkg")
+        .args(&["-l", package])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn is_installed_via_snap(package: &str) -> bool {
+    Command::new("snap")
+        .args(&["list", package])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn is_installed_via_flatpak(app_id: &str) -> bool {
+    Command::new("flatpak")
+        .args(&["list", "--app"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(app_id))
         .unwrap_or(false)
 }
 
