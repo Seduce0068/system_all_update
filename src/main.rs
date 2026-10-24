@@ -2,6 +2,8 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 struct Options {
     dry_run: bool,
@@ -24,6 +26,10 @@ fn print_help() {
     );
     println!("  --install-service  Install systemd boot & resume services for automatic updates");
     println!("  --help             Show this help message");
+    println!();
+    println!("Auto-close:");
+    println!("  Snaps listed in ~/.config/system-all-update/auto-close-snaps are");
+    println!("  closed and refreshed when an update is blocked by running apps.");
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -277,13 +283,51 @@ fn update_snaps(dry_run: bool) {
     let mut refreshed: Vec<String> = Vec::new();
     let mut deferred: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
+    let auto_close = auto_close_snaps();
 
     for name in &pending {
         println!(
             "[INFO] 🚀 Executing: Snap Refresh ({}) (sudo snap refresh {})",
             name, name
         );
-        match refresh_single_snap(name) {
+        let mut outcome = refresh_single_snap(name);
+
+        if matches!(outcome, SnapRefreshOutcome::Deferred)
+            && auto_close.iter().any(|allowed| allowed == name)
+        {
+            match close_snap_apps(name) {
+                Ok(stopped) if !stopped.is_empty() => {
+                    println!(
+                        "[INFO] 🔄 Closed {} ({}) and retrying refresh.",
+                        name,
+                        stopped.join(", ")
+                    );
+                    thread::sleep(Duration::from_secs(1));
+                    outcome = refresh_single_snap(name);
+
+                    // snapd may already be applying its own auto-refresh in
+                    // the background, in which case the explicit retry can
+                    // fail with a "change in progress" style error.
+                    if matches!(outcome, SnapRefreshOutcome::Failed)
+                        && wait_until_snap_refreshed(name, Duration::from_secs(60))
+                    {
+                        println!("[INFO] ℹ️  {} was refreshed by snapd.", name);
+                        outcome = SnapRefreshOutcome::Refreshed;
+                    }
+                }
+                Ok(_) => {
+                    println!(
+                        "[WARN] ⚠️  No active user scope found for {}; leaving it deferred.",
+                        name
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[WARN] ⚠️  Could not close {}: {}", name, e);
+                }
+            }
+        }
+
+        match outcome {
             SnapRefreshOutcome::Refreshed => {
                 println!("[SUCCESS] ✅ {} refreshed successfully.", name);
                 refreshed.push(name.clone());
@@ -435,6 +479,121 @@ fn refresh_single_snap(name: &str) -> SnapRefreshOutcome {
         SnapRefreshOutcome::Deferred
     } else {
         SnapRefreshOutcome::Failed
+    }
+}
+
+/// Snaps the user allowed the updater to close when a refresh is blocked.
+/// The allowlist lives outside the repository so a fresh checkout never
+/// terminates applications without an explicit opt-in.
+fn auto_close_snaps() -> Vec<String> {
+    let home = match env::var("HOME") {
+        Ok(home) => home,
+        Err(_) => return Vec::new(),
+    };
+    let path = Path::new(&home).join(".config/system-all-update/auto-close-snaps");
+    match fs::read_to_string(path) {
+        Ok(contents) => contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_string)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn current_uid() -> Option<u32> {
+    let output = Command::new("id").arg("-u").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+fn apply_user_manager_env(command: &mut Command, uid: u32) {
+    let runtime_dir = format!("/run/user/{}", uid);
+    command.env("XDG_RUNTIME_DIR", &runtime_dir).env(
+        "DBUS_SESSION_BUS_ADDRESS",
+        format!("unix:path={}/bus", runtime_dir),
+    );
+}
+
+/// Stops the systemd user scopes belonging to `name` so snapd can refresh it.
+/// Returns the stopped unit names; an empty list means no scope was running.
+fn close_snap_apps(name: &str) -> Result<Vec<String>, String> {
+    let uid = current_uid().ok_or_else(|| "could not determine the current uid".to_string())?;
+    let bus = format!("/run/user/{}/bus", uid);
+    if !Path::new(&bus).exists() {
+        return Err(format!("user session bus {} is not available", bus));
+    }
+
+    let pattern = format!("snap.{}.*.scope", name);
+    let mut list = Command::new("systemctl");
+    list.args([
+        "--user",
+        "list-units",
+        "--type=scope",
+        "--all",
+        "--no-legend",
+        "--plain",
+        "--no-pager",
+        &pattern,
+    ]);
+    apply_user_manager_env(&mut list, uid);
+    let output = list
+        .output()
+        .map_err(|e| format!("failed to run systemctl: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "systemctl list-units failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let mut units = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let unit = fields.next().unwrap_or("");
+        let load = fields.next().unwrap_or("");
+        let active = fields.next().unwrap_or("");
+        if unit.ends_with(".scope") && load == "loaded" && active == "active" {
+            units.push(unit.to_string());
+        }
+    }
+
+    for unit in &units {
+        println!("[INFO] 🛑 Stopping {} to release {}.", unit, name);
+        let mut stop = Command::new("systemctl");
+        stop.args(["--user", "stop", unit]);
+        apply_user_manager_env(&mut stop, uid);
+        let status = stop
+            .status()
+            .map_err(|e| format!("failed to stop {}: {}", unit, e))?;
+        if !status.success() {
+            return Err(format!("systemctl stop {} failed", unit));
+        }
+    }
+
+    Ok(units)
+}
+
+fn snap_is_pending(name: &str) -> bool {
+    match pending_snap_refreshes() {
+        Some(pending) => pending.iter().any(|pending_name| pending_name == name),
+        None => true,
+    }
+}
+
+fn wait_until_snap_refreshed(name: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !snap_is_pending(name) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_secs(2));
     }
 }
 
