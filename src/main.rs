@@ -177,14 +177,24 @@ fn update_system(dry_run: bool) {
     // 2. Apt update & upgrade (Debian/Ubuntu)
     if which_command("apt") {
         println!("[INFO] Running apt update & upgrade...");
-        let apt_success = run_cmd("Apt Update", "sudo", &["apt", "update"], dry_run);
+        let apt_success = run_cmd(
+            "Apt Update",
+            "sudo",
+            &["apt", "-o", "DPkg::Lock::Timeout=600", "update"],
+            dry_run,
+        );
         if apt_success {
-            run_cmd("Apt Upgrade", "sudo", &["apt", "upgrade", "-y"], dry_run);
+            run_cmd(
+                "Apt Upgrade",
+                "sudo",
+                &["apt", "-o", "DPkg::Lock::Timeout=600", "upgrade", "-y"],
+                dry_run,
+            );
             // Autoremove unused dependencies
             run_cmd(
                 "Apt Autoremove",
                 "sudo",
-                &["apt", "autoremove", "-y"],
+                &["apt", "-o", "DPkg::Lock::Timeout=600", "autoremove", "-y"],
                 dry_run,
             );
         }
@@ -442,13 +452,20 @@ fn update_apps(dry_run: bool) {
             let _ = run_cmd(
                 "Apt Update (for VS Code)",
                 "sudo",
-                &["apt", "update"],
+                &["apt", "-o", "DPkg::Lock::Timeout=600", "update"],
                 dry_run,
             );
             run_cmd(
                 "VS Code Upgrade",
                 "sudo",
-                &["apt", "upgrade", "-y", "code"],
+                &[
+                    "apt",
+                    "-o",
+                    "DPkg::Lock::Timeout=600",
+                    "upgrade",
+                    "-y",
+                    "code",
+                ],
                 dry_run,
             );
         } else if which_command("snap") && is_installed_via_snap("code") {
@@ -511,6 +528,13 @@ fn install_systemd_services(dry_run: bool) {
     };
 
     let current_user = env::var("USER").unwrap_or_else(|_| "koppe".to_string());
+    let home_dir = env::var("HOME").unwrap_or_else(|_| format!("/home/{}", current_user));
+    // systemd starts the service with a minimal PATH, so rustup/cargo in the
+    // user's home would otherwise be invisible.
+    let service_path = format!(
+        "{home}/.cargo/bin:{home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        home = home_dir
+    );
 
     let boot_service = format!(
         r#"[Unit]
@@ -520,13 +544,18 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User={}
-ExecStart={}
+User={user}
+Environment=HOME={home}
+Environment=PATH={path}
+ExecStart={exe}
 
 [Install]
 WantedBy=multi-user.target
 "#,
-        current_user, exe_path
+        user = current_user,
+        home = home_dir,
+        path = service_path,
+        exe = exe_path
     );
 
     let resume_service = format!(
@@ -536,13 +565,18 @@ After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate
 
 [Service]
 Type=oneshot
-User={}
-ExecStart={}
+User={user}
+Environment=HOME={home}
+Environment=PATH={path}
+ExecStart={exe}
 
 [Install]
 WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
 "#,
-        current_user, exe_path
+        user = current_user,
+        home = home_dir,
+        path = service_path,
+        exe = exe_path
     );
 
     let boot_path = "/tmp/system-all-update-boot.service";
