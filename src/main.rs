@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 struct Options {
     dry_run: bool,
@@ -194,7 +194,7 @@ fn update_system(dry_run: bool) {
 
     // 3. Snap packages update
     if which_command("snap") {
-        run_cmd("Snap Refresh", "sudo", &["snap", "refresh"], dry_run);
+        update_snaps(dry_run);
     } else {
         println!("[INFO] snap not found, skipping snap refresh.");
     }
@@ -227,6 +227,185 @@ fn update_system(dry_run: bool) {
         run_cmd("NPM Global Update", "npm", &["update", "-g"], dry_run);
     } else {
         println!("[INFO] npm not found, skipping global npm updates.");
+    }
+}
+
+/// Refreshes each pending snap individually so that one running application
+/// cannot mask the result of the other packages.
+///
+/// Snapd reports snaps with running apps as errors (e.g.
+/// `snap "bitwarden" has running apps`). Such snaps are deferred and reported
+/// at the end instead of being treated as hard failures.
+fn update_snaps(dry_run: bool) {
+    println!("\n=== 📦 Updating Snap Packages ===");
+
+    let pending = match pending_snap_refreshes() {
+        Some(names) => names,
+        None => {
+            println!(
+                "[WARN] Could not query pending snap refreshes; falling back to global refresh."
+            );
+            run_cmd("Snap Refresh", "sudo", &["snap", "refresh"], dry_run);
+            return;
+        }
+    };
+
+    if pending.is_empty() {
+        println!("[INFO] ℹ️  No snap updates available.");
+        return;
+    }
+
+    println!("[INFO] Pending snap refreshes: {}", pending.join(", "));
+
+    if dry_run {
+        for name in &pending {
+            println!("[DRY-RUN] Would execute: sudo snap refresh {}", name);
+        }
+        return;
+    }
+
+    if !ensure_sudo_cached() {
+        eprintln!("[ERROR] ❌ sudo authentication failed; skipping snap refresh.");
+        return;
+    }
+
+    let mut refreshed: Vec<String> = Vec::new();
+    let mut deferred: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+
+    for name in &pending {
+        println!(
+            "[INFO] 🚀 Executing: Snap Refresh ({}) (sudo snap refresh {})",
+            name, name
+        );
+        match refresh_single_snap(name) {
+            SnapRefreshOutcome::Refreshed => {
+                println!("[SUCCESS] ✅ {} refreshed successfully.", name);
+                refreshed.push(name.clone());
+            }
+            SnapRefreshOutcome::Deferred => {
+                println!(
+                    "[WARN] ⚠️  {} was not refreshed because the app is running. Deferred.",
+                    name
+                );
+                deferred.push(name.clone());
+            }
+            SnapRefreshOutcome::Failed => {
+                eprintln!("[ERROR] ❌ {} could not be refreshed.", name);
+                failed.push(name.clone());
+            }
+        }
+    }
+
+    if !deferred.is_empty() {
+        println!("[INFO] ℹ️  Close the following apps, then refresh manually:");
+        for name in &deferred {
+            println!("  - {}", name);
+        }
+        println!("[HINT] sudo snap refresh {}", deferred.join(" "));
+    }
+    if !failed.is_empty() {
+        println!("[INFO] ℹ️  Failed snaps: {}", failed.join(", "));
+    }
+    println!(
+        "[INFO] Snap refresh summary: {} refreshed, {} deferred, {} failed.",
+        refreshed.len(),
+        deferred.len(),
+        failed.len()
+    );
+}
+
+enum SnapRefreshOutcome {
+    Refreshed,
+    Deferred,
+    Failed,
+}
+
+/// Returns the names of snaps with a pending refresh, or `None` when the
+/// query itself failed (offline, snapd unavailable, etc.).
+fn pending_snap_refreshes() -> Option<Vec<String>> {
+    let output = Command::new("snap")
+        .args(["refresh", "--list"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with("Name")
+            || line.starts_with("All snaps up to date")
+            || line.starts_with("No snaps")
+        {
+            continue;
+        }
+        if let Some(name) = line.split_whitespace().next() {
+            names.push(name.to_string());
+        }
+    }
+    Some(names)
+}
+
+/// Makes sure sudo credentials are cached so the per-snap refresh can run
+/// non-interactively (`sudo -n`) and capture snapd's error messages.
+fn ensure_sudo_cached() -> bool {
+    let cached = Command::new("sudo")
+        .args(["-n", "true"])
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if cached {
+        return true;
+    }
+
+    Command::new("sudo")
+        .arg("-v")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn refresh_single_snap(name: &str) -> SnapRefreshOutcome {
+    let output = match Command::new("sudo")
+        .args(["-n", "snap", "refresh", name])
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!(
+                "[ERROR] ❌ Failed to execute 'sudo snap refresh {}': {}",
+                name, e
+            );
+            return SnapRefreshOutcome::Failed;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    print!("{}", stdout);
+    if !stdout.is_empty() && !stdout.ends_with('\n') {
+        println!();
+    }
+    eprint!("{}", stderr);
+    if !stderr.is_empty() && !stderr.ends_with('\n') {
+        eprintln!();
+    }
+
+    if output.status.success() {
+        return SnapRefreshOutcome::Refreshed;
+    }
+
+    let combined = format!("{}{}", stdout, stderr).to_lowercase();
+    if combined.contains("has running apps") || combined.contains("is in use") {
+        SnapRefreshOutcome::Deferred
+    } else {
+        SnapRefreshOutcome::Failed
     }
 }
 
@@ -270,7 +449,9 @@ fn update_apps(dry_run: bool) {
                 dry_run,
             );
         } else {
-            println!("[INFO] VS Code installation method not detected (standalone/.deb manual). Skipping auto-update.");
+            println!(
+                "[INFO] VS Code installation method not detected (standalone/.deb manual). Skipping auto-update."
+            );
             println!("[HINT] Update manually from https://code.visualstudio.com/");
         }
     } else {
@@ -279,7 +460,7 @@ fn update_apps(dry_run: bool) {
 
     if which_command("cargo") {
         let output = Command::new("cargo")
-            .args(&["install-update", "--version"])
+            .args(["install-update", "--version"])
             .output();
 
         if let Ok(o) = output {
@@ -291,7 +472,9 @@ fn update_apps(dry_run: bool) {
                     dry_run,
                 );
             } else {
-                println!("[INFO] cargo-update (cargo install-update) not installed. To install: cargo install cargo-update");
+                println!(
+                    "[INFO] cargo-update (cargo install-update) not installed. To install: cargo install cargo-update"
+                );
             }
         }
     }
@@ -422,7 +605,7 @@ fn which_command(cmd: &str) -> bool {
 
 fn is_installed_via_apt(package: &str) -> bool {
     Command::new("dpkg")
-        .args(&["-l", package])
+        .args(["-l", package])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -430,7 +613,7 @@ fn is_installed_via_apt(package: &str) -> bool {
 
 fn is_installed_via_snap(package: &str) -> bool {
     Command::new("snap")
-        .args(&["list", package])
+        .args(["list", package])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -438,7 +621,7 @@ fn is_installed_via_snap(package: &str) -> bool {
 
 fn is_installed_via_flatpak(app_id: &str) -> bool {
     Command::new("flatpak")
-        .args(&["list", "--app"])
+        .args(["list", "--app"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains(app_id))
         .unwrap_or(false)
