@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 struct Options {
     dry_run: bool,
@@ -264,11 +264,6 @@ fn update_snaps(dry_run: bool) {
         return;
     }
 
-    if !ensure_sudo_cached() {
-        eprintln!("[ERROR] ❌ sudo authentication failed; skipping snap refresh.");
-        return;
-    }
-
     let mut refreshed: Vec<String> = Vec::new();
     let mut deferred: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
@@ -350,31 +345,25 @@ fn pending_snap_refreshes() -> Option<Vec<String>> {
     Some(names)
 }
 
-/// Makes sure sudo credentials are cached so the per-snap refresh can run
-/// non-interactively (`sudo -n`) and capture snapd's error messages.
-fn ensure_sudo_cached() -> bool {
-    let cached = Command::new("sudo")
-        .args(["-n", "true"])
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if cached {
-        return true;
-    }
-
+/// Runs `sudo -n snap refresh <name>` and captures snapd's output.
+fn capture_sudo_snap_refresh(name: &str) -> std::io::Result<std::process::Output> {
     Command::new("sudo")
-        .arg("-v")
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .args(["-n", "snap", "refresh", name])
+        .output()
+}
+
+/// True when sudo refused to run because credentials were not cached.
+/// Only then is an interactive `sudo -v` retry worthwhile.
+fn needs_authentication(output: &std::process::Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    stderr.contains("a password is required")
+        || stderr.contains("no tty present")
+        || stderr.contains("a terminal is required")
+        || stderr.contains("interactive authentication is required")
 }
 
 fn refresh_single_snap(name: &str) -> SnapRefreshOutcome {
-    let output = match Command::new("sudo")
-        .args(["-n", "snap", "refresh", name])
-        .output()
-    {
+    let mut output = match capture_sudo_snap_refresh(name) {
         Ok(output) => output,
         Err(e) => {
             eprintln!(
@@ -384,6 +373,36 @@ fn refresh_single_snap(name: &str) -> SnapRefreshOutcome {
             return SnapRefreshOutcome::Failed;
         }
     };
+
+    // Sudo may be configured with NOPASSWD for `snap` only (common on
+    // systems that run this script from systemd). Try the cached/non-
+    // interactive path first, and ask for a password only when sudo
+    // explicitly reports that authentication is needed.
+    if !output.status.success() && needs_authentication(&output) {
+        println!("[INFO] 🔐 sudo authentication required for snap refresh.");
+        let authenticated = Command::new("sudo")
+            .arg("-v")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !authenticated {
+            eprintln!(
+                "[ERROR] ❌ sudo authentication failed; cannot refresh {}.",
+                name
+            );
+            return SnapRefreshOutcome::Failed;
+        }
+        output = match capture_sudo_snap_refresh(name) {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!(
+                    "[ERROR] ❌ Failed to execute 'sudo snap refresh {}': {}",
+                    name, e
+                );
+                return SnapRefreshOutcome::Failed;
+            }
+        };
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
