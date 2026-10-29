@@ -660,12 +660,24 @@ fn update_apps(dry_run: bool) {
 
         if let Ok(o) = output {
             if o.status.success() {
-                run_cmd(
+                let updated = run_cmd(
                     "Cargo Installed Binaries Update",
                     "cargo",
                     &["install-update", "-a"],
                     dry_run,
                 );
+                // A crates.io connection reset is often transient; retry exactly once.
+                if !updated && !dry_run {
+                    println!(
+                        "[INFO] 🔁 Retrying cargo install-update once (possible transient network error)..."
+                    );
+                    run_cmd(
+                        "Cargo Installed Binaries Update (retry)",
+                        "cargo",
+                        &["install-update", "-a"],
+                        false,
+                    );
+                }
             } else {
                 println!(
                     "[INFO] cargo-update (cargo install-update) not installed. To install: cargo install cargo-update"
