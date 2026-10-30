@@ -970,38 +970,9 @@ fn install_termux_job(dry_run: bool) {
         }
     };
     let config_dir = format!("{}/.config/system-all-update", home);
-    let script_path = format!("{}/termux-job.sh", config_dir);
+    let script_path = format!("{}/termux-job.rs", config_dir);
     let log_dir = format!("{}/.local/share/system-all-update", home);
-
-    let exe_path = match env::current_exe() {
-        Ok(path) => path.to_string_lossy().into_owned(),
-        Err(e) => {
-            eprintln!("[ERROR] Failed to get current executable path: {}", e);
-            return;
-        }
-    };
-
-    let script = format!(
-        r#"#!/data/data/com.termux/files/usr/bin/bash
-set -u
-BASE="{log_dir}"
-LOG="$BASE/job.log"
-LOCK="$BASE/job.lock"
-mkdir -p "$BASE"
-exec 9>"$LOCK"
-if ! flock -n 9; then
-  echo "=== $(date -Iseconds) skipped: another run is active ===" >> "$LOG"
-  exit 0
-fi
-{{
-  echo "=== $(date -Iseconds) ==="
-  "{exe}"
-  echo "exit=$?"
-}} >> "$LOG" 2>&1
-"#,
-        log_dir = log_dir,
-        exe = exe_path
-    );
+    let script = include_str!("../termux-job.rs");
 
     if dry_run {
         println!(
