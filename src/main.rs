@@ -2,8 +2,11 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+
+static HAD_FAILURE: AtomicBool = AtomicBool::new(false);
 
 struct Options {
     dry_run: bool,
@@ -19,12 +22,12 @@ fn print_help() {
     println!();
     println!("Options:");
     println!("  --dry-run          Show commands without executing them");
-    println!("  --references-only  Update only the references (/home/koppe/references)");
-    println!("  --system-only      Update only the system (rustup, apt, snap, npm)");
+    println!("  --references-only  Update only the references (~/references)");
+    println!("  --system-only      Update only system packages (pkg/apt, npm, etc.)");
     println!(
         "  --apps-only        Update only the applications/tools (VS Code, cargo-update, etc.)"
     );
-    println!("  --install-service  Install systemd boot & resume services for automatic updates");
+    println!("  --install-service  Install automatic update service (systemd or Termux job)");
     println!("  --help             Show this help message");
     println!();
     println!("Auto-close:");
@@ -92,10 +95,12 @@ fn run_cmd(name: &str, program: &str, args: &[&str], dry_run: bool) -> bool {
         }
         Ok(s) => {
             eprintln!("[ERROR] ❌ {} failed with exit code: {:?}", name, s.code());
+            HAD_FAILURE.store(true, Ordering::Relaxed);
             false
         }
         Err(e) => {
             eprintln!("[ERROR] ❌ Failed to start command '{}': {}", program, e);
+            HAD_FAILURE.store(true, Ordering::Relaxed);
             false
         }
     }
@@ -142,7 +147,14 @@ fn run_cmd_fwupd(name: &str, program: &str, args: &[&str], dry_run: bool) -> boo
 }
 
 fn update_references(dry_run: bool) {
-    let ref_path = "/home/koppe/references";
+    let ref_path = if is_termux() {
+        env::var("HOME")
+            .map(|home| format!("{}/references", home))
+            .unwrap_or_else(|_| "/home/koppe/references".to_string())
+    } else {
+        "/home/koppe/references".to_string()
+    };
+    let ref_path = ref_path.as_str();
     println!("\n=== 📚 Updating References ({}) ===", ref_path);
 
     if !Path::new(ref_path).exists() {
@@ -172,6 +184,11 @@ fn update_references(dry_run: bool) {
 
 fn update_system(dry_run: bool) {
     println!("\n=== 🖥️ Updating System Components ===");
+
+    if is_termux() {
+        update_termux_system(dry_run);
+        return;
+    }
 
     // 1. Rustup update
     if which_command("rustup") {
@@ -600,6 +617,11 @@ fn wait_until_snap_refreshed(name: &str, timeout: Duration) -> bool {
 fn update_apps(dry_run: bool) {
     println!("\n=== 📱 Updating Applications / Tools ===");
 
+    if is_termux() {
+        update_termux_apps(dry_run);
+        return;
+    }
+
     // VS Code update (detect installation method)
     if which_command("code") {
         println!("[INFO] VS Code (code CLI) is available.");
@@ -688,7 +710,12 @@ fn update_apps(dry_run: bool) {
 }
 
 fn install_systemd_services(dry_run: bool) {
-    println!("\n=== ⚙️ Installing systemd Boot & Resume Services ===");
+    println!("\n=== ⚙️ Installing Automatic Update Service ===");
+
+    if is_termux() {
+        install_termux_job(dry_run);
+        return;
+    }
 
     let exe_path = match env::current_exe() {
         Ok(path) => path.to_string_lossy().into_owned(),
@@ -819,11 +846,215 @@ WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibern
     println!("[SUCCESS] 🎉 systemd services successfully installed and enabled!");
 }
 
+fn is_termux() -> bool {
+    cfg!(target_os = "android")
+        || env::var("PREFIX")
+            .map(|prefix| prefix == "/data/data/com.termux/files/usr")
+            .unwrap_or(false)
+}
+
+/// Termux では sudo がなく、apt を pkg 経由で扱う。
+fn update_termux_system(dry_run: bool) {
+    println!("[INFO] Termux environment detected; using pkg.");
+
+    let updated = run_cmd(
+        "Termux pkg update",
+        "pkg",
+        &["update", "-y", "-o", "DPkg::Lock::Timeout=600"],
+        dry_run,
+    );
+    if updated {
+        run_cmd(
+            "Termux pkg upgrade",
+            "pkg",
+            &[
+                "upgrade",
+                "-y",
+                "-o",
+                "DPkg::Lock::Timeout=600",
+                "-o",
+                "Dpkg::Options::=--force-confdef",
+                "-o",
+                "Dpkg::Options::=--force-confold",
+            ],
+            dry_run,
+        );
+    }
+    run_cmd(
+        "Termux pkg autoclean",
+        "pkg",
+        &["autoclean", "-o", "DPkg::Lock::Timeout=600"],
+        dry_run,
+    );
+
+    if which_command("npm") {
+        run_cmd("NPM Global Update", "npm", &["update", "-g"], dry_run);
+        fix_node_cli_shebangs(dry_run);
+    } else {
+        println!("[INFO] npm not found, skipping global npm updates.");
+    }
+}
+
+/// Termux には VS Code / snap / flatpak がないため、cargo 管理分のみ扱う。
+fn update_termux_apps(dry_run: bool) {
+    if which_command("cargo") {
+        let has_cargo_update = Command::new("cargo")
+            .args(["install-update", "--version"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if has_cargo_update {
+            run_cmd(
+                "Cargo Installed Binaries Update",
+                "cargo",
+                &["install-update", "-a"],
+                dry_run,
+            );
+        } else {
+            println!("[INFO] cargo-update not installed. To install: cargo install cargo-update");
+        }
+    }
+}
+
+/// npm 12 が生成する `#!/usr/bin/env node` は Termux の `/usr/bin/env`
+/// 不在で起動できない。既知のグローバル CLI の shebang を絶対パスへ直す。
+fn fix_node_cli_shebangs(dry_run: bool) {
+    let prefix = match env::var("PREFIX") {
+        Ok(prefix) => prefix,
+        Err(_) => return,
+    };
+    let node = format!("{}/bin/node", prefix);
+    let names = [
+        "eslint",
+        "markdownlint",
+        "gemini",
+        "cline",
+        "lsp-mcp-server",
+        "mcp-server-memory",
+        "zcode",
+    ];
+
+    for name in names {
+        let link = format!("{}/bin/{}", prefix, name);
+        let target = match fs::canonicalize(&link) {
+            Ok(target) => target,
+            Err(_) => continue,
+        };
+        let content = match fs::read_to_string(&target) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        if !content.starts_with("#!/usr/bin/env node") {
+            continue;
+        }
+        if dry_run {
+            println!("[DRY-RUN] Would fix shebang: {}", target.display());
+            continue;
+        }
+        let new_content = content.replacen("#!/usr/bin/env node", &format!("#!{}", node), 1);
+        match fs::write(&target, new_content) {
+            Ok(_) => println!("[SUCCESS] ✅ Fixed shebang: {}", target.display()),
+            Err(e) => eprintln!("[ERROR] ❌ Failed to fix {}: {}", target.display(), e),
+        }
+    }
+}
+
+/// Termux には systemd がないため、Android の JobScheduler を使う。
+/// 実行間隔は約 24 時間で、正確な時刻指定はできない。
+fn install_termux_job(dry_run: bool) {
+    let home = match env::var("HOME") {
+        Ok(home) => home,
+        Err(_) => {
+            eprintln!("[ERROR] HOME is not set.");
+            return;
+        }
+    };
+    let config_dir = format!("{}/.config/system-all-update", home);
+    let script_path = format!("{}/termux-job.sh", config_dir);
+    let log_dir = format!("{}/.local/share/system-all-update", home);
+
+    let exe_path = match env::current_exe() {
+        Ok(path) => path.to_string_lossy().into_owned(),
+        Err(e) => {
+            eprintln!("[ERROR] Failed to get current executable path: {}", e);
+            return;
+        }
+    };
+
+    let script = format!(
+        r#"#!/data/data/com.termux/files/usr/bin/bash
+set -u
+BASE="{log_dir}"
+LOG="$BASE/job.log"
+LOCK="$BASE/job.lock"
+mkdir -p "$BASE"
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo "=== $(date -Iseconds) skipped: another run is active ===" >> "$LOG"
+  exit 0
+fi
+{{
+  echo "=== $(date -Iseconds) ==="
+  "{exe}"
+  echo "exit=$?"
+}} >> "$LOG" 2>&1
+"#,
+        log_dir = log_dir,
+        exe = exe_path
+    );
+
+    if dry_run {
+        println!(
+            "[DRY-RUN] Would write {} and schedule a Termux job.",
+            script_path
+        );
+        return;
+    }
+
+    if let Err(e) = fs::create_dir_all(&config_dir) {
+        eprintln!("[ERROR] Failed to create {}: {}", config_dir, e);
+        return;
+    }
+    if let Err(e) = fs::write(&script_path, script) {
+        eprintln!("[ERROR] Failed to write {}: {}", script_path, e);
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755));
+    }
+
+    run_cmd(
+        "Termux Job Scheduler",
+        "termux-job-scheduler",
+        &[
+            "--script",
+            script_path.as_str(),
+            "--job-id",
+            "1",
+            "--period-ms",
+            "86400000",
+            "--network",
+            "any",
+            "--battery-not-low",
+            "false",
+            "--persisted",
+            "true",
+        ],
+        false,
+    );
+
+    println!("[INFO] Daily job scheduled at approximately 24h intervals.");
+    println!("[INFO] Log: {}/job.log", log_dir);
+}
+
 fn which_command(cmd: &str) -> bool {
     Command::new("which")
         .arg(cmd)
-        .status()
-        .map(|s| s.success())
+        .output()
+        .map(|output| output.status.success())
         .unwrap_or(false)
 }
 
@@ -886,4 +1117,9 @@ fn main() {
     println!("\n========================================");
     println!("       🎉 All Update Tasks Done!        ");
     println!("========================================");
+
+    if HAD_FAILURE.load(Ordering::Relaxed) {
+        eprintln!("[WARN] ⚠️  Some update tasks failed. See the log above.");
+        std::process::exit(1);
+    }
 }

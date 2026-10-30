@@ -6,8 +6,9 @@ Kubuntu 向けのシステム一括更新ツール。references、システム�
 ## 要件
 
 - Rust 1.85 以降（edition 2024）
-- Debian / Ubuntu 系（apt）
-- 任意: rustup, snap, flatpak, fwupd, npm, cargo-update
+- Debian / Ubuntu 系（apt）または Termux（pkg）
+- 任意: rustup, snap, flatpak, fwupd, npm, cargo-update,
+  termux-job-scheduler
 
 ## ビルドとインストール
 
@@ -38,16 +39,31 @@ system-all-update --help             # ヘルプ
 
 | 区分 | 内容 |
 | --- | --- |
-| references | `/home/koppe/references` の `git pull` |
-| system | rustup, apt, snap, flatpak, fwupd, npm |
-| apps | VS Code, `cargo install-update -a` |
+| references | `~/references`（Kubuntu は `/home/koppe/references`）の `git pull` |
+| system | rustup, apt/pkg, snap, flatpak, fwupd, npm |
+| apps | VS Code, `cargo install-update -a`, Node CLI の shebang 修正 |
 
 ## 自動実行
 
-`--install-service` は次のユニットを `/etc/systemd/system/` に導入する。
+`--install-service` はプラットフォームに応じて自動実行を設定する。
+
+### Kubuntu
+
+次のユニットを `/etc/systemd/system/` に導入する。
 
 - `system-all-update-boot.service`: 起動時
 - `system-all-update-resume.service`: suspend / hibernate 復帰時
+
+### Termux
+
+`termux-job-scheduler` に job ID 1 を登録する。実行間隔は約 24 時間で、
+Android の JobScheduler により正確な時刻指定はできない。
+
+- 再起動後も維持: `--persisted true`
+- 実行スクリプト: `~/.config/system-all-update/termux-job.sh`
+- ログ: `~/.local/share/system-all-update/job.log`
+- 登録確認: `termux-job-scheduler --pending`
+- 解除: `termux-job-scheduler --cancel --job-id 1`
 
 ## snap の自動クローズ
 
