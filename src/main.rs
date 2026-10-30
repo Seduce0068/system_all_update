@@ -902,22 +902,27 @@ fn update_termux_system(dry_run: bool) {
 
 /// Termux には VS Code / snap / flatpak がないため、cargo 管理分のみ扱う。
 fn update_termux_apps(dry_run: bool) {
-    if which_command("cargo") {
-        let has_cargo_update = Command::new("cargo")
-            .args(["install-update", "--version"])
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false);
-        if has_cargo_update {
+    let home = env::var("HOME").unwrap_or_default();
+    let cargo_update = format!("{}/.cargo/bin/cargo-install-update", home);
+
+    if Path::new(&cargo_update).exists() {
+        let updated = run_cmd(
+            "Cargo Installed Binaries Update",
+            &cargo_update,
+            &["-a"],
+            dry_run,
+        );
+        if !updated && !dry_run {
+            println!("[INFO] 🔁 Retrying cargo install-update once...");
             run_cmd(
-                "Cargo Installed Binaries Update",
-                "cargo",
-                &["install-update", "-a"],
-                dry_run,
+                "Cargo Installed Binaries Update (retry)",
+                &cargo_update,
+                &["-a"],
+                false,
             );
-        } else {
-            println!("[INFO] cargo-update not installed. To install: cargo install cargo-update");
         }
+    } else {
+        println!("[INFO] cargo-update not installed. To install: cargo install cargo-update");
     }
 }
 
