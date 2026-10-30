@@ -857,16 +857,21 @@ fn is_termux() -> bool {
 fn update_termux_system(dry_run: bool) {
     println!("[INFO] Termux environment detected; using pkg.");
 
+    let prefix =
+        env::var("PREFIX").unwrap_or_else(|_| "/data/data/com.termux/files/usr".to_string());
+    let pkg = format!("{}/bin/pkg", prefix);
+    let npm = format!("{}/bin/npm", prefix);
+
     let updated = run_cmd(
         "Termux pkg update",
-        "pkg",
+        &pkg,
         &["update", "-y", "-o", "DPkg::Lock::Timeout=600"],
         dry_run,
     );
     if updated {
         run_cmd(
             "Termux pkg upgrade",
-            "pkg",
+            &pkg,
             &[
                 "upgrade",
                 "-y",
@@ -882,13 +887,13 @@ fn update_termux_system(dry_run: bool) {
     }
     run_cmd(
         "Termux pkg autoclean",
-        "pkg",
+        &pkg,
         &["autoclean", "-o", "DPkg::Lock::Timeout=600"],
         dry_run,
     );
 
-    if which_command("npm") {
-        run_cmd("NPM Global Update", "npm", &["update", "-g"], dry_run);
+    if Path::new(&npm).exists() {
+        run_cmd("NPM Global Update", &npm, &["update", "-g"], dry_run);
         fix_node_cli_shebangs(dry_run);
     } else {
         println!("[INFO] npm not found, skipping global npm updates.");
@@ -972,6 +977,9 @@ fn install_termux_job(dry_run: bool) {
     let config_dir = format!("{}/.config/system-all-update", home);
     let script_path = format!("{}/termux-job.rs", config_dir);
     let log_dir = format!("{}/.local/share/system-all-update", home);
+    let prefix =
+        env::var("PREFIX").unwrap_or_else(|_| "/data/data/com.termux/files/usr".to_string());
+    let scheduler = format!("{}/bin/termux-job-scheduler", prefix);
     let script = include_str!("../termux-job.rs");
 
     if dry_run {
@@ -999,7 +1007,7 @@ fn install_termux_job(dry_run: bool) {
 
     run_cmd(
         "Termux Job Scheduler",
-        "termux-job-scheduler",
+        &scheduler,
         &[
             "--script",
             script_path.as_str(),
