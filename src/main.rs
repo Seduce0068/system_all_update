@@ -909,7 +909,7 @@ fn update_termux_apps(dry_run: bool) {
         let updated = run_cmd(
             "Cargo Installed Binaries Update",
             &cargo_update,
-            &["-a"],
+            &["install-update", "-a"],
             dry_run,
         );
         if !updated && !dry_run {
@@ -917,7 +917,7 @@ fn update_termux_apps(dry_run: bool) {
             run_cmd(
                 "Cargo Installed Binaries Update (retry)",
                 &cargo_update,
-                &["-a"],
+                &["install-update", "-a"],
                 false,
             );
         }
