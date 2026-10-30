@@ -66,6 +66,11 @@ fn main() {
     entry.push_str(&format!("exit={}\n", output.status.code().unwrap_or(-1)));
     append_log(&log_path, &entry);
 
+    // 次回以降は 24 時間周期で再登録する。
+    let _ = Command::new(format!("{}/.local/bin/system-all-update", home))
+        .arg("--install-service")
+        .status();
+
     if !output.status.success() {
         std::process::exit(output.status.code().unwrap_or(1));
     }
