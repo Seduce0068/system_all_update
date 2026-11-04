@@ -298,7 +298,16 @@ fn update_system(dry_run: bool) {
 
 fn update_rustup_into(dry_run: bool, logs: &mut Vec<String>) -> bool {
     if which_command("rustup") {
-        run_cmd_captured("Rustup Update", "rustup", &["update"], dry_run, logs)
+        // Nightly is intentionally excluded: only the stable toolchain is
+        // updated automatically. Update nightly manually with
+        // `rustup update nightly` when needed.
+        run_cmd_captured(
+            "Rustup Update (stable only)",
+            "rustup",
+            &["update", "stable"],
+            dry_run,
+            logs,
+        )
     } else {
         logs.push("[INFO] rustup not found, skipping.".to_string());
         true
