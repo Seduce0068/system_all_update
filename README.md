@@ -57,8 +57,11 @@ system-all-update --help             # ヘルプ
 | 区分 | 内容 |
 | --- | --- |
 | references | `~/references`（Kubuntu は `/home/koppe/references`）の `git pull` |
-| system | rustup, apt/pkg, snap, flatpak, fwupd, npm |
+| system | rustup (stable のみ), apt/pkg, snap, flatpak, fwupd, npm |
 | apps | VS Code, `cargo install-update -a`, Node CLI の shebang 修正 |
+
+- `rustup update stable` のみ実行する。nightly などの他ツールチェーンは
+  自動更新しない。必要な場合は `rustup update nightly` を手動で実行する
 
 ## 自動実行
 
