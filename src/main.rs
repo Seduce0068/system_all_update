@@ -165,6 +165,65 @@ fn run_cmd_captured(
     }
 }
 
+/// Runs a command and captures its output without marking the overall run as
+/// failed. Used for best-effort steps such as refreshing package lists, where
+/// an unrelated third-party repository can return an error.
+fn run_cmd_optional(
+    name: &str,
+    program: &str,
+    args: &[&str],
+    dry_run: bool,
+    logs: &mut Vec<String>,
+) -> bool {
+    logs.push(format!(
+        "[INFO] 🚀 Executing: {} ({} {})",
+        name,
+        program,
+        args.join(" ")
+    ));
+    if dry_run {
+        logs.push("[DRY-RUN] Skipped execution.".to_string());
+        return true;
+    }
+
+    match Command::new(program).args(args).output() {
+        Ok(output) => {
+            if !output.stdout.is_empty() {
+                logs.push(
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim_end()
+                        .to_string(),
+                );
+            }
+            if !output.stderr.is_empty() {
+                logs.push(
+                    String::from_utf8_lossy(&output.stderr)
+                        .trim_end()
+                        .to_string(),
+                );
+            }
+            if output.status.success() {
+                logs.push(format!("[SUCCESS] ✅ {} completed successfully.", name));
+                true
+            } else {
+                logs.push(format!(
+                    "[WARN] ⚠️  {} failed with exit code: {:?} (continuing)",
+                    name,
+                    output.status.code()
+                ));
+                false
+            }
+        }
+        Err(e) => {
+            logs.push(format!(
+                "[WARN] ⚠️  Failed to start command '{}': {} (continuing)",
+                program, e
+            ));
+            false
+        }
+    }
+}
+
 fn run_cmd_fwupd_captured(
     name: &str,
     program: &str,
@@ -790,13 +849,19 @@ fn update_vscode_into(dry_run: bool, logs: &mut Vec<String>, handle_flatpak: boo
 
     if is_installed_via_apt("code") {
         logs.push("[INFO] VS Code detected as apt package. Updating via apt...".to_string());
-        let _ = run_cmd_captured(
+        let update_ok = run_cmd_optional(
             "Apt Update (for VS Code)",
             "sudo",
             &["apt", "-o", "DPkg::Lock::Timeout=600", "update"],
             dry_run,
             logs,
         );
+        if !update_ok {
+            logs.push(
+                "[WARN] apt update failed (an unrelated repository may be unavailable); continuing with the existing package lists."
+                    .to_string(),
+            );
+        }
         return run_cmd_captured(
             "VS Code Upgrade",
             "sudo",
