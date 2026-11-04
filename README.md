@@ -35,6 +35,23 @@ system-all-update --install-service  # systemd ユニットを導入
 system-all-update --help             # ヘルプ
 ```
 
+## 実行モデル
+
+デフォルト実行（オプションなし）は次の3レーンを並列で進め、
+ファームウェア更新だけを最後に単独実行する。
+
+| レーン | 内容 |
+| --- | --- |
+| System packages | apt, VS Code (apt/snap), snap |
+| User space | rustup, npm, cargo install-update |
+| References & flatpak | git pull, flatpak |
+
+- apt と VS Code の apt 更新は dpkg ロックを共有するため同一レーンで直列
+- snap は同一レーンの最後に実行し、sudo 認証の競合を避ける
+- fwupd は再起動を伴う可能性があるため、他レーン完了後に単独実行
+- 各レーンの出力は完了後にまとめて表示する
+- `--system-only` / `--apps-only` / `--references-only` は従来どおり直列
+
 ## 更新対象
 
 | 区分 | 内容 |

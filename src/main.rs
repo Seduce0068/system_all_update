@@ -106,47 +106,143 @@ fn run_cmd(name: &str, program: &str, args: &[&str], dry_run: bool) -> bool {
     }
 }
 
-fn run_cmd_fwupd(name: &str, program: &str, args: &[&str], dry_run: bool) -> bool {
-    println!(
+/// Runs a command and captures its output for a parallel lane.
+fn run_cmd_captured(
+    name: &str,
+    program: &str,
+    args: &[&str],
+    dry_run: bool,
+    logs: &mut Vec<String>,
+) -> bool {
+    logs.push(format!(
         "[INFO] 🚀 Executing: {} ({} {})",
         name,
         program,
         args.join(" ")
-    );
+    ));
     if dry_run {
-        println!("[DRY-RUN] Skipped execution.");
+        logs.push("[DRY-RUN] Skipped execution.".to_string());
         return true;
     }
 
-    let status = Command::new(program).args(args).status();
-
-    match status {
-        Ok(s) => {
-            let code = s.code().unwrap_or(-1);
-            // fwupdmgr returns exit code 2 when no updates available (success, just nothing to do)
-            if s.success() || code == 2 {
-                if code == 2 {
-                    println!(
-                        "[INFO] ℹ️  {} completed: no firmware updates available.",
-                        name
-                    );
-                } else {
-                    println!("[SUCCESS] ✅ {} completed successfully.", name);
-                }
+    match Command::new(program).args(args).output() {
+        Ok(output) => {
+            if !output.stdout.is_empty() {
+                logs.push(
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim_end()
+                        .to_string(),
+                );
+            }
+            if !output.stderr.is_empty() {
+                logs.push(
+                    String::from_utf8_lossy(&output.stderr)
+                        .trim_end()
+                        .to_string(),
+                );
+            }
+            if output.status.success() {
+                logs.push(format!("[SUCCESS] ✅ {} completed successfully.", name));
                 true
             } else {
-                eprintln!("[ERROR] ❌ {} failed with exit code: {}", name, code);
+                logs.push(format!(
+                    "[ERROR] ❌ {} failed with exit code: {:?}",
+                    name,
+                    output.status.code()
+                ));
+                HAD_FAILURE.store(true, Ordering::Relaxed);
                 false
             }
         }
         Err(e) => {
-            eprintln!("[ERROR] ❌ Failed to start command '{}': {}", program, e);
+            logs.push(format!(
+                "[ERROR] ❌ Failed to start command '{}': {}",
+                program, e
+            ));
+            HAD_FAILURE.store(true, Ordering::Relaxed);
             false
         }
     }
 }
 
+fn run_cmd_fwupd_captured(
+    name: &str,
+    program: &str,
+    args: &[&str],
+    dry_run: bool,
+    logs: &mut Vec<String>,
+) -> bool {
+    logs.push(format!(
+        "[INFO] 🚀 Executing: {} ({} {})",
+        name,
+        program,
+        args.join(" ")
+    ));
+    if dry_run {
+        logs.push("[DRY-RUN] Skipped execution.".to_string());
+        return true;
+    }
+
+    match Command::new(program).args(args).output() {
+        Ok(output) => {
+            if !output.stdout.is_empty() {
+                logs.push(
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim_end()
+                        .to_string(),
+                );
+            }
+            if !output.stderr.is_empty() {
+                logs.push(
+                    String::from_utf8_lossy(&output.stderr)
+                        .trim_end()
+                        .to_string(),
+                );
+            }
+            let code = output.status.code().unwrap_or(-1);
+            if output.status.success() || code == 2 {
+                if code == 2 {
+                    logs.push(format!(
+                        "[INFO] ℹ️  {} completed: no firmware updates available.",
+                        name
+                    ));
+                } else {
+                    logs.push(format!("[SUCCESS] ✅ {} completed successfully.", name));
+                }
+                true
+            } else {
+                logs.push(format!(
+                    "[ERROR] ❌ {} failed with exit code: {}",
+                    name, code
+                ));
+                HAD_FAILURE.store(true, Ordering::Relaxed);
+                false
+            }
+        }
+        Err(e) => {
+            logs.push(format!(
+                "[ERROR] ❌ Failed to start command '{}': {}",
+                program, e
+            ));
+            HAD_FAILURE.store(true, Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+fn print_logs(logs: &[String]) {
+    for line in logs {
+        println!("{}", line);
+    }
+}
+
 fn update_references(dry_run: bool) {
+    let mut logs = Vec::new();
+    update_references_into(dry_run, &mut logs);
+    print_logs(&logs);
+}
+
+fn update_references_into(dry_run: bool, logs: &mut Vec<String>) -> bool {
     let ref_path = if is_termux() {
         env::var("HOME")
             .map(|home| format!("{}/references", home))
@@ -155,111 +251,137 @@ fn update_references(dry_run: bool) {
         "/home/koppe/references".to_string()
     };
     let ref_path = ref_path.as_str();
-    println!("\n=== 📚 Updating References ({}) ===", ref_path);
+    logs.push(format!("\n=== 📚 Updating References ({}) ===", ref_path));
 
     if !Path::new(ref_path).exists() {
-        println!(
+        logs.push(format!(
             "[WARN] References path '{}' does not exist. Skipping.",
             ref_path
-        );
-        return;
+        ));
+        return true;
     }
 
     let git_dir = format!("{}/.git", ref_path);
     if !Path::new(&git_dir).exists() {
-        println!(
+        logs.push(format!(
             "[WARN] References path '{}' is not a git repository. Skipping git pull.",
             ref_path
-        );
-        return;
+        ));
+        return true;
     }
 
-    run_cmd(
+    run_cmd_captured(
         "References Git Pull",
         "git",
         &["-C", ref_path, "pull"],
         dry_run,
-    );
+        logs,
+    )
 }
 
 fn update_system(dry_run: bool) {
-    println!("\n=== 🖥️ Updating System Components ===");
-
+    let mut logs = Vec::new();
     if is_termux() {
         update_termux_system(dry_run);
         return;
     }
 
-    // 1. Rustup update
+    logs.push("\n=== 🖥️ Updating System Components ===".to_string());
+    update_rustup_into(dry_run, &mut logs);
+    update_apt_into(dry_run, &mut logs);
+    update_snaps_into(dry_run, &mut logs);
+    update_flatpak_into(dry_run, &mut logs);
+    update_firmware_into(dry_run, &mut logs);
+    update_npm_into(dry_run, &mut logs);
+    print_logs(&logs);
+}
+
+fn update_rustup_into(dry_run: bool, logs: &mut Vec<String>) -> bool {
     if which_command("rustup") {
-        run_cmd("Rustup Update", "rustup", &["update"], dry_run);
+        run_cmd_captured("Rustup Update", "rustup", &["update"], dry_run, logs)
     } else {
-        println!("[INFO] rustup not found, skipping.");
+        logs.push("[INFO] rustup not found, skipping.".to_string());
+        true
     }
+}
 
-    // 2. Apt update & upgrade (Debian/Ubuntu)
-    if which_command("apt") {
-        println!("[INFO] Running apt update & upgrade...");
-        let apt_success = run_cmd(
-            "Apt Update",
-            "sudo",
-            &["apt", "-o", "DPkg::Lock::Timeout=600", "update"],
-            dry_run,
+fn update_apt_into(dry_run: bool, logs: &mut Vec<String>) -> bool {
+    if !which_command("apt") {
+        logs.push(
+            "[INFO] apt package manager not found, skipping system package upgrade.".to_string(),
         );
-        if apt_success {
-            run_cmd(
-                "Apt Upgrade",
-                "sudo",
-                &["apt", "-o", "DPkg::Lock::Timeout=600", "upgrade", "-y"],
-                dry_run,
-            );
-            // Autoremove unused dependencies
-            run_cmd(
-                "Apt Autoremove",
-                "sudo",
-                &["apt", "-o", "DPkg::Lock::Timeout=600", "autoremove", "-y"],
-                dry_run,
-            );
-        }
-    } else {
-        println!("[INFO] apt package manager not found, skipping system package upgrade.");
+        return true;
     }
 
-    // 3. Snap packages update
-    if which_command("snap") {
-        update_snaps(dry_run);
-    } else {
-        println!("[INFO] snap not found, skipping snap refresh.");
+    logs.push("[INFO] Running apt update & upgrade...".to_string());
+    let apt_success = run_cmd_captured(
+        "Apt Update",
+        "sudo",
+        &["apt", "-o", "DPkg::Lock::Timeout=600", "update"],
+        dry_run,
+        logs,
+    );
+    if !apt_success {
+        return false;
     }
 
-    // 4. Flatpak packages update
+    let upgrade_ok = run_cmd_captured(
+        "Apt Upgrade",
+        "sudo",
+        &["apt", "-o", "DPkg::Lock::Timeout=600", "upgrade", "-y"],
+        dry_run,
+        logs,
+    );
+    let autoremove_ok = run_cmd_captured(
+        "Apt Autoremove",
+        "sudo",
+        &["apt", "-o", "DPkg::Lock::Timeout=600", "autoremove", "-y"],
+        dry_run,
+        logs,
+    );
+    upgrade_ok && autoremove_ok
+}
+
+fn update_flatpak_into(dry_run: bool, logs: &mut Vec<String>) -> bool {
     if which_command("flatpak") {
-        run_cmd("Flatpak Update", "flatpak", &["update", "-y"], dry_run);
-    } else {
-        println!("[INFO] flatpak not found, skipping flatpak update.");
-    }
-
-    // 5. Firmware updates (fwupd)
-    if which_command("fwupdmgr") {
-        println!("[INFO] Running firmware updates via fwupdmgr...");
-        // Use --force to avoid interactive prompt when remotes not enabled
-        let _ = run_cmd(
-            "Fwupd Refresh",
-            "fwupdmgr",
-            &["refresh", "--force"],
+        run_cmd_captured(
+            "Flatpak Update",
+            "flatpak",
+            &["update", "-y"],
             dry_run,
-        );
-        // fwupdmgr update returns exit code 2 when no updates available (not an error)
-        run_cmd_fwupd("Fwupd Update", "fwupdmgr", &["update", "-y"], dry_run);
+            logs,
+        )
     } else {
-        println!("[INFO] fwupdmgr not found, skipping firmware updates.");
+        logs.push("[INFO] flatpak not found, skipping flatpak update.".to_string());
+        true
+    }
+}
+
+fn update_firmware_into(dry_run: bool, logs: &mut Vec<String>) -> bool {
+    if !which_command("fwupdmgr") {
+        logs.push("[INFO] fwupdmgr not found, skipping firmware updates.".to_string());
+        return true;
     }
 
-    // 6. NPM global packages update
+    logs.push("[INFO] Running firmware updates via fwupdmgr...".to_string());
+    // Use --force to avoid interactive prompt when remotes not enabled
+    let _ = run_cmd_captured(
+        "Fwupd Refresh",
+        "fwupdmgr",
+        &["refresh", "--force"],
+        dry_run,
+        logs,
+    );
+    // fwupdmgr update returns exit code 2 when no updates available (not an error)
+    run_cmd_fwupd_captured("Fwupd Update", "fwupdmgr", &["update", "-y"], dry_run, logs)
+}
+
+fn update_npm_into(dry_run: bool, logs: &mut Vec<String>) -> bool {
     if which_command("npm") {
-        run_cmd("NPM Global Update", "npm", &["update", "-g"], dry_run);
+        run_cmd_captured("NPM Global Update", "npm", &["update", "-g"], dry_run, logs)
     } else {
-        println!("[INFO] npm not found, skipping global npm updates.");
+        logs.push("[INFO] npm not found, skipping global npm updates.".to_string());
+        true
     }
 }
 
@@ -269,32 +391,38 @@ fn update_system(dry_run: bool) {
 /// Snapd reports snaps with running apps as errors (e.g.
 /// `snap "bitwarden" has running apps`). Such snaps are deferred and reported
 /// at the end instead of being treated as hard failures.
-fn update_snaps(dry_run: bool) {
-    println!("\n=== 📦 Updating Snap Packages ===");
+fn update_snaps_into(dry_run: bool, logs: &mut Vec<String>) -> bool {
+    logs.push("\n=== 📦 Updating Snap Packages ===".to_string());
 
     let pending = match pending_snap_refreshes() {
         Some(names) => names,
         None => {
-            println!(
+            logs.push(
                 "[WARN] Could not query pending snap refreshes; falling back to global refresh."
+                    .to_string(),
             );
-            run_cmd("Snap Refresh", "sudo", &["snap", "refresh"], dry_run);
-            return;
+            return run_cmd_captured("Snap Refresh", "sudo", &["snap", "refresh"], dry_run, logs);
         }
     };
 
     if pending.is_empty() {
-        println!("[INFO] ℹ️  No snap updates available.");
-        return;
+        logs.push("[INFO] ℹ️  No snap updates available.".to_string());
+        return true;
     }
 
-    println!("[INFO] Pending snap refreshes: {}", pending.join(", "));
+    logs.push(format!(
+        "[INFO] Pending snap refreshes: {}",
+        pending.join(", ")
+    ));
 
     if dry_run {
         for name in &pending {
-            println!("[DRY-RUN] Would execute: sudo snap refresh {}", name);
+            logs.push(format!(
+                "[DRY-RUN] Would execute: sudo snap refresh {}",
+                name
+            ));
         }
-        return;
+        return true;
     }
 
     let mut refreshed: Vec<String> = Vec::new();
@@ -303,24 +431,24 @@ fn update_snaps(dry_run: bool) {
     let auto_close = auto_close_snaps();
 
     for name in &pending {
-        println!(
+        logs.push(format!(
             "[INFO] 🚀 Executing: Snap Refresh ({}) (sudo snap refresh {})",
             name, name
-        );
-        let mut outcome = refresh_single_snap(name);
+        ));
+        let mut outcome = refresh_single_snap_into(name, logs);
 
         if matches!(outcome, SnapRefreshOutcome::Deferred)
             && auto_close.iter().any(|allowed| allowed == name)
         {
             match close_snap_apps(name) {
                 Ok(stopped) if !stopped.is_empty() => {
-                    println!(
+                    logs.push(format!(
                         "[INFO] 🔄 Closed {} ({}) and retrying refresh.",
                         name,
                         stopped.join(", ")
-                    );
+                    ));
                     thread::sleep(Duration::from_secs(1));
-                    outcome = refresh_single_snap(name);
+                    outcome = refresh_single_snap_into(name, logs);
 
                     // snapd may already be applying its own auto-refresh in
                     // the background, in which case the explicit retry can
@@ -328,57 +456,59 @@ fn update_snaps(dry_run: bool) {
                     if matches!(outcome, SnapRefreshOutcome::Failed)
                         && wait_until_snap_refreshed(name, Duration::from_secs(60))
                     {
-                        println!("[INFO] ℹ️  {} was refreshed by snapd.", name);
+                        logs.push(format!("[INFO] ℹ️  {} was refreshed by snapd.", name));
                         outcome = SnapRefreshOutcome::Refreshed;
                     }
                 }
                 Ok(_) => {
-                    println!(
+                    logs.push(format!(
                         "[WARN] ⚠️  No active user scope found for {}; leaving it deferred.",
                         name
-                    );
+                    ));
                 }
                 Err(e) => {
-                    eprintln!("[WARN] ⚠️  Could not close {}: {}", name, e);
+                    logs.push(format!("[WARN] ⚠️  Could not close {}: {}", name, e));
                 }
             }
         }
 
         match outcome {
             SnapRefreshOutcome::Refreshed => {
-                println!("[SUCCESS] ✅ {} refreshed successfully.", name);
+                logs.push(format!("[SUCCESS] ✅ {} refreshed successfully.", name));
                 refreshed.push(name.clone());
             }
             SnapRefreshOutcome::Deferred => {
-                println!(
+                logs.push(format!(
                     "[WARN] ⚠️  {} was not refreshed because the app is running. Deferred.",
                     name
-                );
+                ));
                 deferred.push(name.clone());
             }
             SnapRefreshOutcome::Failed => {
-                eprintln!("[ERROR] ❌ {} could not be refreshed.", name);
+                logs.push(format!("[ERROR] ❌ {} could not be refreshed.", name));
                 failed.push(name.clone());
             }
         }
     }
 
     if !deferred.is_empty() {
-        println!("[INFO] ℹ️  Close the following apps, then refresh manually:");
+        logs.push("[INFO] ℹ️  Close the following apps, then refresh manually:".to_string());
         for name in &deferred {
-            println!("  - {}", name);
+            logs.push(format!("  - {}", name));
         }
-        println!("[HINT] sudo snap refresh {}", deferred.join(" "));
+        logs.push(format!("[HINT] sudo snap refresh {}", deferred.join(" ")));
     }
     if !failed.is_empty() {
-        println!("[INFO] ℹ️  Failed snaps: {}", failed.join(", "));
+        logs.push(format!("[INFO] ℹ️  Failed snaps: {}", failed.join(", ")));
     }
-    println!(
+    logs.push(format!(
         "[INFO] Snap refresh summary: {} refreshed, {} deferred, {} failed.",
         refreshed.len(),
         deferred.len(),
         failed.len()
-    );
+    ));
+
+    failed.is_empty()
 }
 
 enum SnapRefreshOutcome {
@@ -433,14 +563,14 @@ fn needs_authentication(output: &std::process::Output) -> bool {
         || stderr.contains("interactive authentication is required")
 }
 
-fn refresh_single_snap(name: &str) -> SnapRefreshOutcome {
+fn refresh_single_snap_into(name: &str, logs: &mut Vec<String>) -> SnapRefreshOutcome {
     let mut output = match capture_sudo_snap_refresh(name) {
         Ok(output) => output,
         Err(e) => {
-            eprintln!(
+            logs.push(format!(
                 "[ERROR] ❌ Failed to execute 'sudo snap refresh {}': {}",
                 name, e
-            );
+            ));
             return SnapRefreshOutcome::Failed;
         }
     };
@@ -450,26 +580,26 @@ fn refresh_single_snap(name: &str) -> SnapRefreshOutcome {
     // interactive path first, and ask for a password only when sudo
     // explicitly reports that authentication is needed.
     if !output.status.success() && needs_authentication(&output) {
-        println!("[INFO] 🔐 sudo authentication required for snap refresh.");
+        logs.push("[INFO] 🔐 sudo authentication required for snap refresh.".to_string());
         let authenticated = Command::new("sudo")
             .arg("-v")
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
         if !authenticated {
-            eprintln!(
+            logs.push(format!(
                 "[ERROR] ❌ sudo authentication failed; cannot refresh {}.",
                 name
-            );
+            ));
             return SnapRefreshOutcome::Failed;
         }
         output = match capture_sudo_snap_refresh(name) {
             Ok(output) => output,
             Err(e) => {
-                eprintln!(
+                logs.push(format!(
                     "[ERROR] ❌ Failed to execute 'sudo snap refresh {}': {}",
                     name, e
-                );
+                ));
                 return SnapRefreshOutcome::Failed;
             }
         };
@@ -478,13 +608,11 @@ fn refresh_single_snap(name: &str) -> SnapRefreshOutcome {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    print!("{}", stdout);
-    if !stdout.is_empty() && !stdout.ends_with('\n') {
-        println!();
+    if !stdout.is_empty() {
+        logs.push(stdout.trim_end().to_string());
     }
-    eprint!("{}", stderr);
-    if !stderr.is_empty() && !stderr.ends_with('\n') {
-        eprintln!();
+    if !stderr.is_empty() {
+        logs.push(stderr.trim_end().to_string());
     }
 
     if output.status.success() {
@@ -615,98 +743,145 @@ fn wait_until_snap_refreshed(name: &str, timeout: Duration) -> bool {
 }
 
 fn update_apps(dry_run: bool) {
-    println!("\n=== 📱 Updating Applications / Tools ===");
-
+    let mut logs = Vec::new();
     if is_termux() {
         update_termux_apps(dry_run);
         return;
     }
 
-    // VS Code update (detect installation method)
-    if which_command("code") {
-        println!("[INFO] VS Code (code CLI) is available.");
-        let _ = Command::new("code").arg("--version").status();
+    logs.push("\n=== 📱 Updating Applications / Tools ===".to_string());
+    update_vscode_into(dry_run, &mut logs, true);
+    update_cargo_into(dry_run, &mut logs);
+    print_logs(&logs);
+}
 
-        // Detect installation method and update accordingly
-        if is_installed_via_apt("code") {
-            println!("[INFO] VS Code detected as apt package. Updating via apt...");
-            let _ = run_cmd(
-                "Apt Update (for VS Code)",
-                "sudo",
-                &["apt", "-o", "DPkg::Lock::Timeout=600", "update"],
-                dry_run,
-            );
-            run_cmd(
-                "VS Code Upgrade",
-                "sudo",
-                &[
-                    "apt",
-                    "-o",
-                    "DPkg::Lock::Timeout=600",
-                    "upgrade",
-                    "-y",
-                    "code",
-                ],
-                dry_run,
-            );
-        } else if which_command("snap") && is_installed_via_snap("code") {
-            println!("[INFO] VS Code detected as snap package. Updating via snap...");
-            run_cmd(
-                "VS Code Snap Refresh",
-                "sudo",
-                &["snap", "refresh", "code"],
-                dry_run,
-            );
-        } else if which_command("flatpak") && is_installed_via_flatpak("com.visualstudio.code") {
-            println!("[INFO] VS Code detected as flatpak. Updating via flatpak...");
-            run_cmd(
-                "VS Code Flatpak Update",
-                "flatpak",
-                &["update", "-y", "com.visualstudio.code"],
-                dry_run,
-            );
-        } else {
-            println!(
-                "[INFO] VS Code installation method not detected (standalone/.deb manual). Skipping auto-update."
-            );
-            println!("[HINT] Update manually from https://code.visualstudio.com/");
-        }
-    } else {
-        println!("[INFO] VS Code CLI ('code') not found in PATH.");
+fn update_vscode_into(dry_run: bool, logs: &mut Vec<String>, handle_flatpak: bool) -> bool {
+    if !which_command("code") {
+        logs.push("[INFO] VS Code CLI ('code') not found in PATH.".to_string());
+        return true;
     }
 
-    if which_command("cargo") {
-        let output = Command::new("cargo")
-            .args(["install-update", "--version"])
-            .output();
-
-        if let Ok(o) = output {
-            if o.status.success() {
-                let updated = run_cmd(
-                    "Cargo Installed Binaries Update",
-                    "cargo",
-                    &["install-update", "-a"],
-                    dry_run,
-                );
-                // A crates.io connection reset is often transient; retry exactly once.
-                if !updated && !dry_run {
-                    println!(
-                        "[INFO] 🔁 Retrying cargo install-update once (possible transient network error)..."
-                    );
-                    run_cmd(
-                        "Cargo Installed Binaries Update (retry)",
-                        "cargo",
-                        &["install-update", "-a"],
-                        false,
-                    );
-                }
-            } else {
-                println!(
-                    "[INFO] cargo-update (cargo install-update) not installed. To install: cargo install cargo-update"
-                );
-            }
+    logs.push("[INFO] VS Code (code CLI) is available.".to_string());
+    if let Ok(output) = Command::new("code").arg("--version").output() {
+        if !output.stdout.is_empty() {
+            logs.push(
+                String::from_utf8_lossy(&output.stdout)
+                    .trim_end()
+                    .to_string(),
+            );
+        }
+        if !output.stderr.is_empty() {
+            logs.push(
+                String::from_utf8_lossy(&output.stderr)
+                    .trim_end()
+                    .to_string(),
+            );
         }
     }
+
+    if is_installed_via_apt("code") {
+        logs.push("[INFO] VS Code detected as apt package. Updating via apt...".to_string());
+        let _ = run_cmd_captured(
+            "Apt Update (for VS Code)",
+            "sudo",
+            &["apt", "-o", "DPkg::Lock::Timeout=600", "update"],
+            dry_run,
+            logs,
+        );
+        return run_cmd_captured(
+            "VS Code Upgrade",
+            "sudo",
+            &[
+                "apt",
+                "-o",
+                "DPkg::Lock::Timeout=600",
+                "upgrade",
+                "-y",
+                "code",
+            ],
+            dry_run,
+            logs,
+        );
+    }
+
+    if which_command("snap") && is_installed_via_snap("code") {
+        logs.push("[INFO] VS Code detected as snap package. Updating via snap...".to_string());
+        return run_cmd_captured(
+            "VS Code Snap Refresh",
+            "sudo",
+            &["snap", "refresh", "code"],
+            dry_run,
+            logs,
+        );
+    }
+
+    if which_command("flatpak") && is_installed_via_flatpak("com.visualstudio.code") {
+        if !handle_flatpak {
+            logs.push(
+                "[INFO] VS Code is flatpak-managed; the flatpak lane will update it.".to_string(),
+            );
+            return true;
+        }
+        logs.push("[INFO] VS Code detected as flatpak. Updating via flatpak...".to_string());
+        return run_cmd_captured(
+            "VS Code Flatpak Update",
+            "flatpak",
+            &["update", "-y", "com.visualstudio.code"],
+            dry_run,
+            logs,
+        );
+    }
+
+    logs.push(
+        "[INFO] VS Code installation method not detected (standalone/.deb manual). Skipping auto-update."
+            .to_string(),
+    );
+    logs.push("[HINT] Update manually from https://code.visualstudio.com/".to_string());
+    true
+}
+
+fn update_cargo_into(dry_run: bool, logs: &mut Vec<String>) -> bool {
+    if !which_command("cargo") {
+        return true;
+    }
+
+    let output = Command::new("cargo")
+        .args(["install-update", "--version"])
+        .output();
+
+    let Ok(o) = output else {
+        return true;
+    };
+    if !o.status.success() {
+        logs.push(
+            "[INFO] cargo-update (cargo install-update) not installed. To install: cargo install cargo-update"
+                .to_string(),
+        );
+        return true;
+    }
+
+    let updated = run_cmd_captured(
+        "Cargo Installed Binaries Update",
+        "cargo",
+        &["install-update", "-a"],
+        dry_run,
+        logs,
+    );
+    // A crates.io connection reset is often transient; retry exactly once.
+    if !updated && !dry_run {
+        logs.push(
+            "[INFO] 🔁 Retrying cargo install-update once (possible transient network error)..."
+                .to_string(),
+        );
+        return run_cmd_captured(
+            "Cargo Installed Binaries Update (retry)",
+            "cargo",
+            &["install-update", "-a"],
+            false,
+            logs,
+        );
+    }
+    updated
 }
 
 fn install_systemd_services(dry_run: bool) {
@@ -1045,16 +1220,16 @@ fn which_command(cmd: &str) -> bool {
 fn is_installed_via_apt(package: &str) -> bool {
     Command::new("dpkg")
         .args(["-l", package])
-        .status()
-        .map(|s| s.success())
+        .output()
+        .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
 fn is_installed_via_snap(package: &str) -> bool {
     Command::new("snap")
         .args(["list", package])
-        .status()
-        .map(|s| s.success())
+        .output()
+        .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
@@ -1064,6 +1239,97 @@ fn is_installed_via_flatpak(app_id: &str) -> bool {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains(app_id))
         .unwrap_or(false)
+}
+
+struct LaneResult {
+    name: &'static str,
+    logs: Vec<String>,
+    failed: bool,
+}
+
+/// Caches sudo credentials once so parallel lanes do not race on a prompt.
+fn ensure_sudo(dry_run: bool) {
+    if dry_run || is_termux() {
+        return;
+    }
+
+    let cached = Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if cached {
+        return;
+    }
+
+    println!("[INFO] 🔐 sudo authentication is required once before parallel updates.");
+    let _ = Command::new("sudo").arg("-v").status();
+}
+
+fn run_all_parallel(dry_run: bool) {
+    ensure_sudo(dry_run);
+
+    let (system_lane, user_lane, misc_lane) = thread::scope(|scope| {
+        let system_lane = scope.spawn(|| {
+            let mut logs = Vec::new();
+            logs.push("\n=== 🖥️ System Packages Lane ===".to_string());
+            let apt_ok = update_apt_into(dry_run, &mut logs);
+            let vscode_ok = update_vscode_into(dry_run, &mut logs, false);
+            let snap_ok = update_snaps_into(dry_run, &mut logs);
+            LaneResult {
+                name: "System packages",
+                logs,
+                failed: !(apt_ok && vscode_ok && snap_ok),
+            }
+        });
+
+        let user_lane = scope.spawn(|| {
+            let mut logs = Vec::new();
+            logs.push("\n=== 👤 User Space Lane ===".to_string());
+            let rustup_ok = update_rustup_into(dry_run, &mut logs);
+            let npm_ok = update_npm_into(dry_run, &mut logs);
+            let cargo_ok = update_cargo_into(dry_run, &mut logs);
+            LaneResult {
+                name: "User space",
+                logs,
+                failed: !(rustup_ok && npm_ok && cargo_ok),
+            }
+        });
+
+        let misc_lane = scope.spawn(|| {
+            let mut logs = Vec::new();
+            logs.push("\n=== 📚 References & Flatpak Lane ===".to_string());
+            let refs_ok = update_references_into(dry_run, &mut logs);
+            let flatpak_ok = update_flatpak_into(dry_run, &mut logs);
+            LaneResult {
+                name: "References & flatpak",
+                logs,
+                failed: !(refs_ok && flatpak_ok),
+            }
+        });
+
+        (
+            system_lane.join().unwrap(),
+            user_lane.join().unwrap(),
+            misc_lane.join().unwrap(),
+        )
+    });
+
+    for lane in [system_lane, user_lane, misc_lane] {
+        let marker = if lane.failed { "⚠️" } else { "✅" };
+        println!("\n=== {} Lane: {} ===", marker, lane.name);
+        print_logs(&lane.logs);
+        if lane.failed {
+            eprintln!("[ERROR] ❌ Lane '{}' reported failures.", lane.name);
+        }
+    }
+
+    // Firmware updates run alone: they may require a reboot and must not
+    // overlap with other package managers.
+    let mut firmware_logs = Vec::new();
+    firmware_logs.push("\n=== ⚙️ Firmware Updates (single lane) ===".to_string());
+    update_firmware_into(dry_run, &mut firmware_logs);
+    print_logs(&firmware_logs);
 }
 
 fn main() {
@@ -1086,16 +1352,20 @@ fn main() {
 
     let run_all = !opts.references_only && !opts.system_only && !opts.apps_only;
 
-    if run_all || opts.references_only {
-        update_references(opts.dry_run);
-    }
+    if run_all && !is_termux() {
+        run_all_parallel(opts.dry_run);
+    } else {
+        if run_all || opts.references_only {
+            update_references(opts.dry_run);
+        }
 
-    if run_all || opts.system_only {
-        update_system(opts.dry_run);
-    }
+        if run_all || opts.system_only {
+            update_system(opts.dry_run);
+        }
 
-    if run_all || opts.apps_only {
-        update_apps(opts.dry_run);
+        if run_all || opts.apps_only {
+            update_apps(opts.dry_run);
+        }
     }
 
     println!("\n========================================");
