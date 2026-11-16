@@ -446,7 +446,19 @@ fn update_firmware_into(dry_run: bool, logs: &mut Vec<String>) -> bool {
 
 fn update_npm_into(dry_run: bool, logs: &mut Vec<String>) -> bool {
     if which_command("npm") {
-        run_cmd_captured("NPM Global Update", "npm", &["update", "-g"], dry_run, logs)
+        let ok = run_cmd_captured("NPM Global Update", "npm", &["update", "-g"], dry_run, logs);
+        // DSH は next タグを使用するため、npm update -g で latest タグに
+        // ダウングレードされるのを防ぐ。npm update -g 後に next タグを再インストールする。
+        if ok {
+            run_cmd_captured(
+                "DSH Reinstall (next tag)",
+                "npm",
+                &["install", "-g", "@deepseek-ai/dsh@next"],
+                dry_run,
+                logs,
+            );
+        }
+        ok
     } else {
         logs.push("[INFO] npm not found, skipping global npm updates.".to_string());
         true
@@ -1143,6 +1155,14 @@ fn update_termux_system(dry_run: bool) {
 
     if Path::new(&npm).exists() {
         run_cmd("NPM Global Update", &npm, &["update", "-g"], dry_run);
+        // DSH は next タグを使用するため、npm update -g で latest タグに
+        // ダウングレードされるのを防ぐ。
+        run_cmd(
+            "DSH Reinstall (next tag)",
+            &npm,
+            &["install", "-g", "@deepseek-ai/dsh@next"],
+            dry_run,
+        );
         fix_node_cli_shebangs(dry_run);
     } else {
         println!("[INFO] npm not found, skipping global npm updates.");
