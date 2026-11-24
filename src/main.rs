@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -302,13 +302,15 @@ fn update_references(dry_run: bool) {
 }
 
 fn update_references_into(dry_run: bool, logs: &mut Vec<String>) -> bool {
-    let ref_path = if is_termux() {
-        env::var("HOME")
-            .map(|home| format!("{}/references", home))
-            .unwrap_or_else(|_| "/home/koppe/references".to_string())
-    } else {
-        "/home/koppe/references".to_string()
+    // マシン固有の絶対パスを使わず、実行ユーザーの HOME から解決する。
+    let home = match env::var("HOME") {
+        Ok(home) if !home.is_empty() => home,
+        _ => {
+            logs.push("[WARN] HOME is not set; skipping references update.".to_string());
+            return true;
+        }
     };
+    let ref_path = format!("{}/references", home);
     let ref_path = ref_path.as_str();
     logs.push(format!("\n=== 📚 Updating References ({}) ===", ref_path));
 
@@ -447,13 +449,13 @@ fn update_firmware_into(dry_run: bool, logs: &mut Vec<String>) -> bool {
 fn update_npm_into(dry_run: bool, logs: &mut Vec<String>) -> bool {
     if which_command("npm") {
         let ok = run_cmd_captured("NPM Global Update", "npm", &["update", "-g"], dry_run, logs);
-        // DSH は next タグを使用するため、npm update -g で latest タグに
-        // ダウングレードされるのを防ぐ。npm update -g 後に next タグを再インストールする。
+        // npm の既定タグ（latest）は安定リリース。pre-release を自動導入しないよう
+        // npm update -g の後に安定タグを明示して再インストールする。
         if ok {
             run_cmd_captured(
-                "DSH Reinstall (next tag)",
+                "DSH Reinstall (stable tag)",
                 "npm",
-                &["install", "-g", "@deepseek-ai/dsh@next"],
+                &["install", "-g", "@deepseek-ai/dsh@latest"],
                 dry_run,
                 logs,
             );
@@ -986,8 +988,20 @@ fn install_systemd_services(dry_run: bool) {
         }
     };
 
-    let current_user = env::var("USER").unwrap_or_else(|_| "koppe".to_string());
-    let home_dir = env::var("HOME").unwrap_or_else(|_| format!("/home/{}", current_user));
+    let home_dir = match env::var("HOME") {
+        Ok(home) if !home.is_empty() => home,
+        _ => {
+            eprintln!("[ERROR] HOME is not set; cannot install service units.");
+            return;
+        }
+    };
+    // USER が無い環境では HOME の最終コンポーネントをユーザー名に使う。
+    let current_user = env::var("USER").unwrap_or_else(|_| {
+        Path::new(&home_dir)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "user".to_string())
+    });
     // systemd starts the service with a minimal PATH, so rustup/cargo in the
     // user's home would otherwise be invisible.
     let service_path = format!(
@@ -1038,49 +1052,75 @@ WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibern
         exe = exe_path
     );
 
-    let boot_path = "/tmp/system-all-update-boot.service";
-    let resume_path = "/tmp/system-all-update-resume.service";
+    // 固定 /tmp パスを避け、mkdtemp で衝突しない一時ディレクトリを作る。
+    let template = env::temp_dir().join("system-all-update-service.XXXXXX");
+    let temp_dir = match Command::new("mktemp").arg("-d").arg(&template).output() {
+        Ok(output) if output.status.success() => {
+            PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+        }
+        Ok(output) => {
+            eprintln!(
+                "[ERROR] mktemp -d failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("[ERROR] Failed to run mktemp -d: {}", e);
+            return;
+        }
+    };
+    let boot_path = temp_dir.join("system-all-update-boot.service");
+    let resume_path = temp_dir.join("system-all-update-resume.service");
 
-    if let Err(e) = fs::write(boot_path, boot_service) {
+    if let Err(e) = fs::write(&boot_path, boot_service) {
         eprintln!("[ERROR] Failed to write temporary boot service file: {}", e);
+        let _ = fs::remove_dir_all(&temp_dir);
         return;
     }
-    if let Err(e) = fs::write(resume_path, resume_service) {
+    if let Err(e) = fs::write(&resume_path, resume_service) {
         eprintln!(
             "[ERROR] Failed to write temporary resume service file: {}",
             e
         );
+        let _ = fs::remove_dir_all(&temp_dir);
         return;
     }
 
     if dry_run {
-        println!("[DRY-RUN] Would move service files to /etc/systemd/system/ and enable them.");
+        println!("[DRY-RUN] Would install service files into /etc/systemd/system/ and enable them.");
+        let _ = fs::remove_dir_all(&temp_dir);
         return;
     }
 
-    // Move to /etc/systemd/system/ using sudo
-    if !run_cmd(
+    // install でモードを明示して配置する（mv は既存ファイルの属性を残す）。
+    let boot_src = boot_path.to_string_lossy().into_owned();
+    let resume_src = resume_path.to_string_lossy().into_owned();
+    let installed = run_cmd(
         "Install Boot Service",
         "sudo",
         &[
-            "mv",
-            boot_path,
+            "install",
+            "-m",
+            "0644",
+            boot_src.as_str(),
             "/etc/systemd/system/system-all-update-boot.service",
         ],
         false,
-    ) {
-        return;
-    }
-    if !run_cmd(
+    ) && run_cmd(
         "Install Resume Service",
         "sudo",
         &[
-            "mv",
-            resume_path,
+            "install",
+            "-m",
+            "0644",
+            resume_src.as_str(),
             "/etc/systemd/system/system-all-update-resume.service",
         ],
         false,
-    ) {
+    );
+    let _ = fs::remove_dir_all(&temp_dir);
+    if !installed {
         return;
     }
 
@@ -1155,12 +1195,11 @@ fn update_termux_system(dry_run: bool) {
 
     if Path::new(&npm).exists() {
         run_cmd("NPM Global Update", &npm, &["update", "-g"], dry_run);
-        // DSH は next タグを使用するため、npm update -g で latest タグに
-        // ダウングレードされるのを防ぐ。
+        // pre-release（next）を自動導入しないよう、安定タグを明示する。
         run_cmd(
-            "DSH Reinstall (next tag)",
+            "DSH Reinstall (stable tag)",
             &npm,
-            &["install", "-g", "@deepseek-ai/dsh@next"],
+            &["install", "-g", "@deepseek-ai/dsh@latest"],
             dry_run,
         );
         fix_node_cli_shebangs(dry_run);

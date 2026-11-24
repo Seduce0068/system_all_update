@@ -56,7 +56,7 @@ system-all-update --help             # ヘルプ
 
 | 区分 | 内容 |
 | --- | --- |
-| references | `~/references`（Kubuntu は `/home/koppe/references`）の `git pull` |
+| references | `$HOME/references` の `git pull`（HOME 未設定時はスキップ） |
 | system | rustup (stable のみ), apt/pkg, snap, flatpak, fwupd, npm |
 | apps | VS Code, `cargo install-update -a`, Node CLI の shebang 修正 |
 
